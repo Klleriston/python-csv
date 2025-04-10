@@ -1,1 +1,5 @@
 venv_sql/
+backupFreela.bak
+exported_data/
+exported_data_split/
+database_schema/
