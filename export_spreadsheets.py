@@ -4,6 +4,9 @@ import os
 from datetime import datetime
 import split_by_date
 
+# Configurações globais
+ESTABELECIMENTOS_ALVO = [2, 5]
+
 # Definição das colunas para garantir que todas sejam exportadas
 colunas_contatos = [
     "ID", "Código", "Nome", "Fantasia", "Endereço", "Número", "Complemento",
@@ -19,7 +22,7 @@ colunas_contatos = [
 colunas_contas_pagar = [
     "ID", "Fornecedor", "Data emissao", "Data vencimento", "Data Liquidacao",
     "Valor documento", "Saldo", "Situação", "Numero documento", "Categoria",
-    "Historico", "Pago", "Competencia", "Forma Pagamento"
+    "Historico", "Pago", "Competencia", "Forma Pagamento", "Estabelecimento_id"
 ]
 
 colunas_contas_receber = [
@@ -60,7 +63,6 @@ def get_table_columns(table_name):
         return [row[0] for row in cursor.fetchall()]
 
 def create_empty_excel_with_columns(filename, columns):
-    """Create an empty Excel file with only the column headers"""
     df = pd.DataFrame(columns=columns)
     excel_path = f'{OUTPUT_DIR}/{filename}'
     df.to_excel(excel_path, index=False)
@@ -68,40 +70,33 @@ def create_empty_excel_with_columns(filename, columns):
 
 def exportar_e_dividir(df, nome_arquivo, colunas_esperadas, tipo_arquivo):
     """Exporta um DataFrame para Excel e o divide em arquivos de até 2MB"""
-    # Garantir que todas as colunas estão presentes
     for coluna in colunas_esperadas:
         if coluna not in df.columns:
             if coluna == 'Contribuinte':
-                df[coluna] = 0  # Valor padrão numérico (0 = Não contribuinte)
+                df[coluna] = 0  
             else:
                 df[coluna] = ''
     
-    # Reordenar colunas conforme a lista especificada
     df = df[colunas_esperadas]
     
-    # Formatar datas no padrão DD/MM/YYYY
     colunas_data = [col for col in df.columns if 'data' in col.lower() or 'emissao' in col.lower() or 'nascimento' in col.lower() or 'vencimento' in col.lower() or 'liquidacao' in col.lower()]
     for col in colunas_data:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
             df[col] = df[col].dt.strftime('%d/%m/%Y')
     
-    # Garantir que Contribuinte seja numérico para contatos
     if tipo_arquivo == 'contatos' and 'Contribuinte' in df.columns:
         df['Contribuinte'] = df['Contribuinte'].apply(lambda x: 
             1 if str(x).lower() in ['1', 'sim', 'yes', 'true', 'verdadeiro', 'y', 's', 't', 'v'] 
             else 0)
         
-        # Para pessoa jurídica, definir Contribuinte como 1
         if 'Tipo pessoa' in df.columns:
             df.loc[df['Tipo pessoa'] == 'Jurídica', 'Contribuinte'] = 1
     
-    # Exportar arquivo completo
     excel_path = f'{OUTPUT_DIR}/{nome_arquivo}'
     df.to_excel(excel_path, index=False)
     print(f"Exportados {len(df)} registros para {nome_arquivo}")
     
-    # Dividir o arquivo conforme o tipo
     if tipo_arquivo == 'contatos':
         split_by_date.process_contacts()
     elif tipo_arquivo == 'contas_pagar':
@@ -128,7 +123,9 @@ try:
         exit(0)
     
     print("\nExportando Contas a Pagar...")
-    contas_pagar_query = """
+    estabelecimentos_lista = ','.join(map(str, ESTABELECIMENTOS_ALVO))
+    
+    contas_pagar_query = f"""
     SELECT 
         dfp.DOC_FINANCEIRO_PARCELA_ID AS ID, 
         p.NM_PESS_IDENT AS Fornecedor,
@@ -152,7 +149,8 @@ try:
             ELSE 'Não' 
         END AS Pago,
         CONVERT(VARCHAR(7), df.DT_DFIN_EMISS, 120) AS Competencia,
-        tc.DS_TCOBR_IDENT AS [Forma Pagamento]
+        tc.DS_TCOBR_IDENT AS [Forma Pagamento],
+        df.ESTABELECIMENTO_ID AS Estabelecimento_id
     FROM 
         DOC_FINANCEIRO_PARCELA dfp
     JOIN 
@@ -165,6 +163,7 @@ try:
         TIPO_COBR tc ON dfp.TIPO_COBR_ID = tc.TIPO_COBR_ID
     WHERE 
         df.NO_DFIN_TIPO = 2  -- Type 2 = Accounts Payable (Contas a Pagar)
+        AND df.ESTABELECIMENTO_ID IN ({estabelecimentos_lista})
     """
     
     contas_pagar_df = query_to_df(contas_pagar_query)
@@ -174,47 +173,54 @@ try:
     taxas_column = "0 AS Taxas"
     if has_txcobr:
         taxas_column = "dfp.VL_DFINP_TXCOBR AS Taxas" 
+        
+    estabelecimentos_lista = ','.join(map(str, ESTABELECIMENTOS_ALVO))
+
     
     contas_receber_query = f"""
-    SELECT 
-        dfp.DOC_FINANCEIRO_PARCELA_ID AS Id, 
-        p.NM_PESS_IDENT AS Cliente,
-        df.DT_DFIN_EMISS AS [Data Emissao],
-        dfp.DT_DFINP_VENC AS [Data vencimento],
-        dfp.DT_DFINP_QUIT AS [Data Liquidacao],
-        dfp.VL_DFINP_PARC AS [Valor documento],
-        CASE 
-            WHEN dfp.DT_DFINP_QUIT IS NOT NULL THEN 0
-            ELSE dfp.VL_DFINP_PARC 
-        END AS Saldo,
-        CASE 
-            WHEN dfp.DT_DFINP_QUIT IS NULL THEN 'Em Aberto' 
-            ELSE 'Liquidado' 
-        END AS Situacao,
-        df.CD_DFIN_DOCUM AS [Numero do documento],
-        dfp.NO_DFINP_COBR_ELE AS [Numero no banco],
-        cp.DS_CPAG_IDENT AS Categoria,
-        dfp.DS_DFINP_HIST AS Historico,
-        tc.DS_TCOBR_IDENT AS [Forma de recebimento],
-        '' AS [Meio de recebimento],
-        {taxas_column}
-    FROM 
-        DOC_FINANCEIRO_PARCELA dfp
-    JOIN 
-        DOC_FINANCEIRO df ON dfp.DOC_FINANCEIRO_ID = df.DOC_FINANCEIRO_ID
-    JOIN 
-        PESSOA p ON df.PESSOA_ID = p.PESSOA_ID
-    LEFT JOIN
-        COND_PAGTO cp ON df.COND_PAGTO_ID = cp.COND_PAGTO_ID
-    LEFT JOIN
-        TIPO_COBR tc ON dfp.TIPO_COBR_ID = tc.TIPO_COBR_ID
-    WHERE 
-        df.NO_DFIN_TIPO = 1  -- Type 1 = Accounts Receivable (Contas a Receber)
-    """
+SELECT 
+    dfp.DOC_FINANCEIRO_PARCELA_ID AS Id, 
+    p.NM_PESS_IDENT AS Cliente,
+    df.DT_DFIN_EMISS AS [Data Emissao],
+    dfp.DT_DFINP_VENC AS [Data vencimento],
+    dfp.DT_DFINP_QUIT AS [Data Liquidacao],
+    dfp.VL_DFINP_PARC AS [Valor documento],
+    CASE 
+        WHEN dfp.DT_DFINP_QUIT IS NOT NULL THEN 0
+        ELSE dfp.VL_DFINP_PARC 
+    END AS Saldo,
+    CASE 
+        WHEN dfp.DT_DFINP_QUIT IS NULL THEN 'Em Aberto' 
+        ELSE 'Liquidado' 
+    END AS Situacao,
+    df.CD_DFIN_DOCUM AS [Numero do documento],
+    dfp.NO_DFINP_COBR_ELE AS [Numero no banco],
+    cp.DS_CPAG_IDENT AS Categoria,
+    dfp.DS_DFINP_HIST AS Historico,
+    tc.DS_TCOBR_IDENT AS [Forma de recebimento],
+    '' AS [Meio de recebimento],
+    {taxas_column},
+    df.ESTABELECIMENTO_ID AS Estabelecimento_id
+FROM 
+    DOC_FINANCEIRO_PARCELA dfp
+JOIN 
+    DOC_FINANCEIRO df ON dfp.DOC_FINANCEIRO_ID = df.DOC_FINANCEIRO_ID
+JOIN 
+    PESSOA p ON df.PESSOA_ID = p.PESSOA_ID
+LEFT JOIN
+    COND_PAGTO cp ON df.COND_PAGTO_ID = cp.COND_PAGTO_ID
+LEFT JOIN
+    TIPO_COBR tc ON dfp.TIPO_COBR_ID = tc.TIPO_COBR_ID
+WHERE 
+    df.NO_DFIN_TIPO = 1  -- Type 1 = Accounts Receivable (Contas a Receber)
+    AND df.ESTABELECIMENTO_ID IN ({estabelecimentos_lista})
+"""
     
     contas_receber_df = query_to_df(contas_receber_query)
+    print(f"Filtrados apenas registros dos estabelecimentos {ESTABELECIMENTOS_ALVO}")
+    if "Estabelecimento_id" not in colunas_contas_receber:
+        colunas_contas_receber.append("Estabelecimento_id")
     exportar_e_dividir(contas_receber_df, 'contas_a_receber.xlsx', colunas_contas_receber, 'contas_receber')
-    
     print("\nExportando Contatos...")
     
     contatos_query = """
@@ -289,7 +295,6 @@ try:
     contatos_df = query_to_df(contatos_query)
     exportar_e_dividir(contatos_df, 'contatos.xlsx', colunas_contatos, 'contatos')
     
-    # Verificar se há arquivos grandes que precisam ser subdivididos adicionalmente
     split_by_date.adicional_split_large_files()
     
     print(f"Todos os dados exportados e divididos com sucesso às {datetime.now().strftime('%H:%M:%S')}")
